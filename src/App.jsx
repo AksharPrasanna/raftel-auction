@@ -15,7 +15,7 @@ function App() {
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('auction');
 
-  // Timer effect
+  // Timer effect - Fixed to properly handle auction end
   useEffect(() => {
     if (!currentAuction || timeLeft <= 0) return;
 
@@ -23,16 +23,18 @@ function App() {
       setTimeLeft(prev => {
         const newTime = prev - 1;
         
-        // Update database every 5 seconds
-        if (newTime % 5 === 0 && newTime > 0 && currentAuction) {
+        // Update database every 10 seconds
+        if (newTime % 10 === 0 && newTime > 0 && currentAuction) {
           supabase
             .from('current_auction')
             .update({ time_left: newTime })
-            .eq('id', currentAuction.id);
+            .eq('id', currentAuction.id)
+            .then(() => console.log('Timer updated:', newTime));
         }
         
         // End auction when time reaches 0
         if (newTime <= 0) {
+          console.log('Timer reached 0, ending auction...');
           endAuction();
           return 0;
         }
@@ -42,12 +44,16 @@ function App() {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [currentAuction?.id, timeLeft]); // Added dependency on auction ID
+  }, [currentAuction?.id, timeLeft]);
 
   // Initialize app
   useEffect(() => {
     initializeApp();
-    setupRealtimeSubscriptions();
+    const cleanup = setupRealtimeSubscriptions();
+    
+    return () => {
+      if (cleanup) cleanup();
+    };
   }, []);
 
   const initializeApp = async () => {
@@ -65,35 +71,52 @@ function App() {
   };
 
   const setupRealtimeSubscriptions = () => {
+    console.log('Setting up real-time subscriptions...');
+    
     // Teams subscription
     const teamsChannel = supabase
       .channel('teams_changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'teams' }, 
-        () => loadTeams())
+        (payload) => {
+          console.log('Teams changed:', payload);
+          loadTeams();
+        })
       .subscribe();
 
     // Game state subscription
     const gameStateChannel = supabase
       .channel('game_state_changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'game_state' }, 
-        () => loadGameState())
+        (payload) => {
+          console.log('Game state changed:', payload);
+          loadGameState();
+        })
       .subscribe();
 
-    // Auction subscription
+    // Auction subscription - Fixed to handle all events properly
     const auctionChannel = supabase
       .channel('auction_changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'current_auction' }, 
         (payload) => {
+          console.log('Auction changed:', payload);
           if (payload.eventType === 'DELETE') {
+            console.log('Auction deleted, clearing state...');
             setCurrentAuction(null);
             setTimeLeft(0);
-          } else {
+            // Try to start next auction after a delay
+            setTimeout(() => startNextAuctionFromQueue(), 2000);
+          } else if (payload.eventType === 'INSERT') {
+            console.log('New auction created');
+            loadCurrentAuction();
+          } else if (payload.eventType === 'UPDATE') {
+            console.log('Auction updated');
             loadCurrentAuction();
           }
         })
       .subscribe();
 
     return () => {
+      console.log('Cleaning up subscriptions...');
       teamsChannel.unsubscribe();
       gameStateChannel.unsubscribe();
       auctionChannel.unsubscribe();
@@ -101,48 +124,77 @@ function App() {
   };
 
   const loadTeams = async () => {
-    const { data, error } = await supabase.from('teams').select('*');
-    if (error) throw error;
-    
-    const teamsObj = {};
-    data?.forEach(team => {
-      teamsObj[team.id] = team;
-    });
-    setTeams(teamsObj);
+    try {
+      const { data, error } = await supabase.from('teams').select('*');
+      if (error) throw error;
+      
+      const teamsObj = {};
+      data?.forEach(team => {
+        teamsObj[team.id] = team;
+      });
+      setTeams(teamsObj);
+      console.log('Teams loaded:', Object.keys(teamsObj).length);
+    } catch (error) {
+      console.error('Error loading teams:', error);
+    }
   };
 
   const loadGameState = async () => {
-    const { data } = await supabase.from('game_state').select('*').single();
-    if (data) {
-      setGameState(data);
-    } else {
-      await supabase.from('game_state').upsert({ id: 1, current_nominator_index: 0, round: 1 });
-      setGameState({ id: 1, current_nominator_index: 0, round: 1 });
+    try {
+      const { data } = await supabase.from('game_state').select('*').single();
+      if (data) {
+        setGameState(data);
+        console.log('Game state loaded:', data);
+      } else {
+        const newGameState = { id: 1, current_nominator_index: 0, round: 1 };
+        await supabase.from('game_state').upsert(newGameState);
+        setGameState(newGameState);
+        console.log('Created new game state');
+      }
+    } catch (error) {
+      console.error('Error loading game state:', error);
     }
   };
 
   const loadCurrentAuction = async () => {
-    const { data } = await supabase
-      .from('current_auction')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    if (data) {
-      setCurrentAuction(data);
-      setTimeLeft(data.time_left || 0);
-    } else {
+    try {
+      const { data, error } = await supabase
+        .from('current_auction')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(); // Use maybeSingle to avoid error when no auction exists
+      
+      if (error && error.code !== 'PGRST116') {
+        throw error;
+      }
+      
+      if (data) {
+        console.log('Current auction loaded:', data);
+        setCurrentAuction(data);
+        setTimeLeft(data.time_left || 0);
+      } else {
+        console.log('No current auction found');
+        setCurrentAuction(null);
+        setTimeLeft(0);
+      }
+    } catch (error) {
+      console.error('Error loading current auction:', error);
       setCurrentAuction(null);
       setTimeLeft(0);
     }
   };
 
   const endAuction = async () => {
-    if (!currentAuction) return;
+    if (!currentAuction) {
+      console.log('No auction to end');
+      return;
+    }
+
+    console.log('Ending auction for:', currentAuction.player_name);
 
     try {
-      if (currentAuction.leading_bidder) {
+      if (currentAuction.leading_bidder && teams[currentAuction.leading_bidder]) {
         // Update winner's team
         const winner = teams[currentAuction.leading_bidder];
         const newPlayers = [...(winner.players || []), {
@@ -150,61 +202,88 @@ function App() {
           price: currentAuction.current_bid
         }];
 
-        await supabase.from('teams').update({
+        const { error: updateError } = await supabase.from('teams').update({
           players: newPlayers,
           budget: winner.budget - currentAuction.current_bid,
           total_spent: (winner.total_spent || 0) + currentAuction.current_bid
         }).eq('id', currentAuction.leading_bidder);
 
+        if (updateError) throw updateError;
+
         alert(`${currentAuction.player_name} sold to ${winner.name} for €${currentAuction.current_bid}M!`);
       } else {
         // No bids - give to nominator
         const nominator = teams[currentAuction.nominated_by];
-        const newPlayers = [...(nominator.players || []), {
-          name: currentAuction.player_name,
-          price: currentAuction.base_price
-        }];
+        if (nominator) {
+          const newPlayers = [...(nominator.players || []), {
+            name: currentAuction.player_name,
+            price: currentAuction.base_price
+          }];
 
-        await supabase.from('teams').update({
-          players: newPlayers,
-          budget: nominator.budget - currentAuction.base_price,
-          total_spent: (nominator.total_spent || 0) + currentAuction.base_price
-        }).eq('id', currentAuction.nominated_by);
+          const { error: updateError } = await supabase.from('teams').update({
+            players: newPlayers,
+            budget: nominator.budget - currentAuction.base_price,
+            total_spent: (nominator.total_spent || 0) + currentAuction.base_price
+          }).eq('id', currentAuction.nominated_by);
 
-        alert(`No bids! ${currentAuction.player_name} goes to ${nominator.name} for €${currentAuction.base_price}M!`);
+          if (updateError) throw updateError;
+
+          alert(`No bids! ${currentAuction.player_name} goes to ${nominator.name} for €${currentAuction.base_price}M!`);
+        }
       }
 
-      // Clear auction and bids
-      await supabase.from('current_auction').delete().eq('id', currentAuction.id);
-      await supabase.from('smart_bids').delete().eq('auction_id', currentAuction.id);
+      // Clear auction and related data
+      const { error: deleteAuctionError } = await supabase
+        .from('current_auction')
+        .delete()
+        .eq('id', currentAuction.id);
+      
+      if (deleteAuctionError) throw deleteAuctionError;
 
-      // Start next auction after delay
-      setTimeout(() => startNextAuctionFromQueue(), 2000);
+      // Clean up bids and passes
+      await supabase.from('smart_bids').delete().eq('auction_id', currentAuction.id);
+      await supabase.from('player_passes').delete().eq('auction_id', currentAuction.id);
+
+      console.log('Auction ended successfully');
+
+      // The real-time subscription will handle starting the next auction
 
     } catch (error) {
       console.error('Error ending auction:', error);
+      alert('Error ending auction: ' + error.message);
     }
   };
 
   const startNextAuctionFromQueue = async () => {
     try {
-      const { data: nextPlayer } = await supabase
+      console.log('Checking for next player in queue...');
+      
+      const { data: nextPlayer, error } = await supabase
         .from('auction_queue')
         .select('*')
         .order('created_at', { ascending: true })
         .limit(1)
-        .single();
+        .maybeSingle();
+
+      if (error && error.code !== 'PGRST116') {
+        throw error;
+      }
 
       if (nextPlayer) {
+        console.log('Starting auction for next player:', nextPlayer);
         await startNextAuction(nextPlayer);
+      } else {
+        console.log('No more players in queue');
       }
     } catch (error) {
-      console.log('No more players in queue');
+      console.error('Error starting next auction from queue:', error);
     }
   };
 
   const startNextAuction = async (playerData) => {
     try {
+      console.log('Creating auction for:', playerData.player_name);
+      
       const { data: auctionData, error: auctionError } = await supabase
         .from('current_auction')
         .insert({
@@ -219,7 +298,17 @@ function App() {
 
       if (auctionError) throw auctionError;
 
-      await supabase.from('auction_queue').delete().eq('id', playerData.id);
+      // Remove from queue
+      const { error: deleteError } = await supabase
+        .from('auction_queue')
+        .delete()
+        .eq('id', playerData.id);
+
+      if (deleteError) {
+        console.error('Error removing from queue:', deleteError);
+      }
+
+      console.log('New auction created:', auctionData);
       
     } catch (error) {
       console.error('Error starting auction:', error);
@@ -266,6 +355,7 @@ function App() {
       await supabase.from('current_auction').delete().neq('id', 0);
       await supabase.from('smart_bids').delete().neq('id', 0);
       await supabase.from('auction_queue').delete().neq('id', 0);
+      await supabase.from('player_passes').delete().neq('id', 0);
 
       alert('System reset successfully!');
       window.location.reload();
@@ -273,6 +363,12 @@ function App() {
       console.error('Reset failed:', error);
       alert('Reset failed: ' + error.message);
     }
+  };
+
+  // Manual refresh function for debugging
+  const handleManualRefresh = async () => {
+    console.log('Manual refresh triggered');
+    await initializeApp();
   };
 
   if (loading) {
@@ -319,6 +415,18 @@ function App() {
         <header className="text-center text-white mb-8">
           <h1 className="text-4xl font-bold mb-2">⚽ Raftel Premier League Auction</h1>
           <p className="text-xl opacity-90">Build your ultimate team within budget!</p>
+          
+          {/* Debug info - remove in production */}
+          <div className="mt-4 text-sm opacity-75">
+            <p>Current Auction: {currentAuction ? currentAuction.player_name : 'None'}</p>
+            <p>Time Left: {timeLeft}s</p>
+            <button 
+              onClick={handleManualRefresh} 
+              className="btn btn-sm bg-white bg-opacity-20 text-white mt-2"
+            >
+              🔄 Manual Refresh
+            </button>
+          </div>
         </header>
 
         <div style={{ 
@@ -341,7 +449,7 @@ function App() {
               teams={teams}
               activeTab={activeTab}
               onTabChange={setActiveTab}
-              onRefresh={initializeApp}
+              onRefresh={handleManualRefresh}
             />
           </div>
         </div>
