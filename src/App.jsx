@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from './services/supabase.js';
+import { playerSearchService } from './services/playerSearch.js';
 import LoginScreen from './components/LoginScreen.jsx';
 import UserPanel from './components/UserPanel.jsx';
 import AuctionPanel from './components/AuctionPanel.jsx';
@@ -80,6 +81,8 @@ function App() {
         (payload) => {
           console.log('Teams changed:', payload);
           loadTeams();
+          // Refresh sold players list when teams update (new purchases)
+          playerSearchService.refreshSoldPlayers();
         })
       .subscribe();
 
@@ -103,6 +106,8 @@ function App() {
             console.log('Auction deleted, clearing state...');
             setCurrentAuction(null);
             setTimeLeft(0);
+            // Refresh sold players when auction ends
+            playerSearchService.refreshSoldPlayers();
             // Try to start next auction after a delay
             setTimeout(() => startNextAuctionFromQueue(), 2000);
           } else if (payload.eventType === 'INSERT') {
@@ -194,6 +199,11 @@ function App() {
     console.log('Ending auction for:', currentAuction.player_name);
 
     try {
+      // FIRST: Clean up related data that references the auction (fix foreign key constraint)
+      console.log('Cleaning up auction-related data...');
+      await supabase.from('smart_bids').delete().eq('auction_id', currentAuction.id);
+      await supabase.from('player_passes').delete().eq('auction_id', currentAuction.id);
+
       if (currentAuction.leading_bidder && teams[currentAuction.leading_bidder]) {
         // Update winner's team
         const winner = teams[currentAuction.leading_bidder];
@@ -209,6 +219,9 @@ function App() {
         }).eq('id', currentAuction.leading_bidder);
 
         if (updateError) throw updateError;
+
+        // Add player to sold list immediately
+        playerSearchService.addSoldPlayer(currentAuction.player_name);
 
         alert(`${currentAuction.player_name} sold to ${winner.name} for €${currentAuction.current_bid}M!`);
       } else {
@@ -228,21 +241,21 @@ function App() {
 
           if (updateError) throw updateError;
 
+          // Add player to sold list immediately
+          playerSearchService.addSoldPlayer(currentAuction.player_name);
+
           alert(`No bids! ${currentAuction.player_name} goes to ${nominator.name} for €${currentAuction.base_price}M!`);
         }
       }
 
-      // Clear auction and related data
+      // LAST: Delete the auction record (after cleaning up foreign key references)
+      console.log('Deleting auction record...');
       const { error: deleteAuctionError } = await supabase
         .from('current_auction')
         .delete()
         .eq('id', currentAuction.id);
       
       if (deleteAuctionError) throw deleteAuctionError;
-
-      // Clean up bids and passes
-      await supabase.from('smart_bids').delete().eq('auction_id', currentAuction.id);
-      await supabase.from('player_passes').delete().eq('auction_id', currentAuction.id);
 
       console.log('Auction ended successfully');
 
@@ -357,6 +370,9 @@ function App() {
       await supabase.from('auction_queue').delete().neq('id', 0);
       await supabase.from('player_passes').delete().neq('id', 0);
 
+      // Reset sold players list
+      await playerSearchService.refreshSoldPlayers();
+
       alert('System reset successfully!');
       window.location.reload();
     } catch (error) {
@@ -369,6 +385,8 @@ function App() {
   const handleManualRefresh = async () => {
     console.log('Manual refresh triggered');
     await initializeApp();
+    // Also refresh sold players list
+    await playerSearchService.refreshSoldPlayers();
   };
 
   if (loading) {
@@ -420,6 +438,12 @@ function App() {
           <div className="mt-4 text-sm opacity-75">
             <p>Current Auction: {currentAuction ? currentAuction.player_name : 'None'}</p>
             <p>Time Left: {timeLeft}s</p>
+            {(() => {
+              const stats = playerSearchService.getPlayerStats();
+              return (
+                <p>Players: {stats.available} available / {stats.sold} sold / {stats.total} total</p>
+              );
+            })()}
             <button 
               onClick={handleManualRefresh} 
               className="btn btn-sm bg-white bg-opacity-20 text-white mt-2"

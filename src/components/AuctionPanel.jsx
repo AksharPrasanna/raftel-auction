@@ -63,6 +63,15 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
       return;
     }
 
+    // NEW RULE 1: Check if user is the nominator and no other bids have been placed
+    const isNominator = currentAuction.nominated_by === currentUser.id;
+    const hasOtherBids = currentAuction.current_bid > currentAuction.base_price;
+    
+    if (isNominator && !hasOtherBids) {
+      alert('As the nominator, you cannot bid until someone else places a bid first!');
+      return;
+    }
+
     const team = teams[currentUser.id];
     const playersNeeded = 16 - (team.players ? team.players.length : 0);
     const maxBid = playersNeeded > 1 ? team.budget - (playersNeeded - 1) : team.budget;
@@ -129,6 +138,12 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
       return;
     }
 
+    // NEW RULE 2: Check if user is the current leading bidder
+    if (currentAuction.leading_bidder === currentUser.id) {
+      alert('You cannot pass while you are the leading bidder!');
+      return;
+    }
+
     if (!confirm('Are you sure you want to pass on this player? You cannot bid after passing.')) {
       return;
     }
@@ -172,6 +187,11 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
     if (!currentAuction) return;
 
     try {
+      // FIRST: Clean up related data that references the auction (fix foreign key constraint)
+      console.log('Cleaning up auction-related data...');
+      await supabase.from('smart_bids').delete().eq('auction_id', currentAuction.id);
+      await supabase.from('player_passes').delete().eq('auction_id', currentAuction.id);
+
       if (currentAuction.leading_bidder) {
         // Update winner's team
         const winner = teams[currentAuction.leading_bidder];
@@ -204,10 +224,9 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
         alert(`All teams passed! ${currentAuction.player_name} goes to ${nominator.name} for €${currentAuction.base_price}M!`);
       }
 
-      // Clear auction and bids
+      // LAST: Delete the auction record (after cleaning up foreign key references)
+      console.log('Deleting auction record...');
       await supabase.from('current_auction').delete().eq('id', currentAuction.id);
-      await supabase.from('smart_bids').delete().eq('auction_id', currentAuction.id);
-      await supabase.from('player_passes').delete().eq('auction_id', currentAuction.id);
 
       onRefresh();
     } catch (error) {
@@ -403,7 +422,7 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
                 </div>
               </div>
 
-              {/* Player Stats Display */}
+              {/* Simplified Player Info Display */}
               <PlayerStatsDisplay 
                 playerName={currentAuction.player_name} 
                 isVisible={true}
@@ -416,25 +435,58 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
                   Click an increment to place your bid immediately. Timer resets to 30s on each bid!
                 </p>
                 
+                {/* Check for special conditions */}
+                {(() => {
+                  const isNominator = currentAuction.nominated_by === currentUser.id;
+                  const hasOtherBids = currentAuction.current_bid > currentAuction.base_price;
+                  const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                  
+                  // Show warning for nominator who can't bid yet
+                  if (isNominator && !hasOtherBids) {
+                    return (
+                      <div className="mb-4 p-3 bg-orange-100 border border-orange-300 rounded">
+                        <span className="text-orange-800 text-sm font-semibold">
+                          ⏳ As nominator, wait for someone else to bid first!
+                        </span>
+                      </div>
+                    );
+                  }
+                  
+                  return null;
+                })()}
+                
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem' }}>
-                  {[0.5, 1, 2, 5, 10, 20].map((increment) => (
-                    <button
-                      key={increment}
-                      onClick={() => placeBid(increment)}
-                      disabled={loading || hasUserPassed || (currentAuction.leading_bidder === currentUser.id)}
-                      className={`btn btn-primary btn-sm ${
-                        loading || hasUserPassed || currentAuction.leading_bidder === currentUser.id
-                          ? 'opacity-50 cursor-not-allowed' : ''
-                      }`}
-                      title={
-                        hasUserPassed ? 'You have passed on this player' :
-                        currentAuction.leading_bidder === currentUser.id ? 'You are already leading!' : 
-                        `Bid €${currentAuction.current_bid + increment}M`
-                      }
-                    >
-                      +{increment}M
-                    </button>
-                  ))}
+                  {[0.5, 1, 2, 5, 10, 20].map((increment) => {
+                    const isNominator = currentAuction.nominated_by === currentUser.id;
+                    const hasOtherBids = currentAuction.current_bid > currentAuction.base_price;
+                    const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                    
+                    const isDisabled = loading || 
+                                     hasUserPassed || 
+                                     isLeadingBidder || 
+                                     (isNominator && !hasOtherBids);
+                    
+                    const getTooltip = () => {
+                      if (hasUserPassed) return 'You have passed on this player';
+                      if (isLeadingBidder) return 'You are already leading!';
+                      if (isNominator && !hasOtherBids) return 'Wait for someone else to bid first';
+                      return `Bid €${currentAuction.current_bid + increment}M`;
+                    };
+                    
+                    return (
+                      <button
+                        key={increment}
+                        onClick={() => placeBid(increment)}
+                        disabled={isDisabled}
+                        className={`btn btn-primary btn-sm ${
+                          isDisabled ? 'opacity-50 cursor-not-allowed' : ''
+                        }`}
+                        title={getTooltip()}
+                      >
+                        +{increment}M
+                      </button>
+                    );
+                  })}
                 </div>
                 
                 {hasUserPassed && (
@@ -454,20 +506,35 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mt-4">
                 <h4 className="font-bold text-blue-800 mb-2">⚡ Quick Actions</h4>
                 <div className="flex gap-2">
-                  <button
-                    onClick={() => placeBid(1)}
-                    disabled={loading || hasUserPassed || (currentAuction.leading_bidder === currentUser.id)}
-                    className="btn btn-primary btn-sm flex-1"
-                  >
-                    Minimum Bid (+1M)
-                  </button>
-                  <button
-                    onClick={() => placeBid(5)}
-                    disabled={loading || hasUserPassed || (currentAuction.leading_bidder === currentUser.id)}
-                    className="btn btn-primary btn-sm flex-1"
-                  >
-                    Standard Bid (+5M)
-                  </button>
+                  {(() => {
+                    const isNominator = currentAuction.nominated_by === currentUser.id;
+                    const hasOtherBids = currentAuction.current_bid > currentAuction.base_price;
+                    const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                    
+                    const isDisabled = loading || 
+                                     hasUserPassed || 
+                                     isLeadingBidder || 
+                                     (isNominator && !hasOtherBids);
+                    
+                    return (
+                      <>
+                        <button
+                          onClick={() => placeBid(1)}
+                          disabled={isDisabled}
+                          className="btn btn-primary btn-sm flex-1"
+                        >
+                          Minimum Bid (+1M)
+                        </button>
+                        <button
+                          onClick={() => placeBid(5)}
+                          disabled={isDisabled}
+                          className="btn btn-primary btn-sm flex-1"
+                        >
+                          Standard Bid (+5M)
+                        </button>
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -476,9 +543,23 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
                 <h4 className="font-bold text-red-800 mb-2">🚫 Pass Option</h4>
                 <p className="text-sm text-red-700 mb-3">
                   Don't want this player? Pass and let others continue bidding.
-                  {currentAuction.nominated_by === currentUser.id && currentAuction.current_bid === currentAuction.base_price && (
-                    <span className="block mt-1 font-semibold">⚠️ As nominator, you must wait for a bid before passing!</span>
-                  )}
+                  {(() => {
+                    const isNominator = currentAuction.nominated_by === currentUser.id;
+                    const hasBids = currentAuction.current_bid > currentAuction.base_price;
+                    const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                    
+                    if (isNominator && !hasBids) {
+                      return (
+                        <span className="block mt-1 font-semibold">⚠️ As nominator, you must wait for a bid before passing!</span>
+                      );
+                    }
+                    if (isLeadingBidder) {
+                      return (
+                        <span className="block mt-1 font-semibold">⚠️ You cannot pass while you are the leading bidder!</span>
+                      );
+                    }
+                    return null;
+                  })()}
                 </p>
                 
                 {/* Show current passes */}
@@ -497,23 +578,39 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
 
                 <button
                   onClick={handlePass}
-                  disabled={
-                    loading || 
-                    hasUserPassed || 
-                    (currentAuction.nominated_by === currentUser.id && currentAuction.current_bid === currentAuction.base_price)
-                  }
+                  disabled={(() => {
+                    const isNominator = currentAuction.nominated_by === currentUser.id;
+                    const hasBids = currentAuction.current_bid > currentAuction.base_price;
+                    const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                    
+                    return loading || 
+                           hasUserPassed || 
+                           (isNominator && !hasBids) ||
+                           isLeadingBidder;
+                  })()}
                   className={`btn w-full ${
-                    hasUserPassed 
-                      ? 'bg-gray-300 text-gray-500 cursor-not-allowed' 
-                      : (currentAuction.nominated_by === currentUser.id && currentAuction.current_bid === currentAuction.base_price)
-                        ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                        : 'bg-red-500 text-white hover:bg-red-600'
+                    (() => {
+                      const isNominator = currentAuction.nominated_by === currentUser.id;
+                      const hasBids = currentAuction.current_bid > currentAuction.base_price;
+                      const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                      
+                      if (hasUserPassed || (isNominator && !hasBids) || isLeadingBidder) {
+                        return 'bg-gray-300 text-gray-500 cursor-not-allowed';
+                      }
+                      return 'bg-red-500 text-white hover:bg-red-600';
+                    })()
                   }`}
                 >
-                  {hasUserPassed ? '✓ You have passed' : 
-                   (currentAuction.nominated_by === currentUser.id && currentAuction.current_bid === currentAuction.base_price)
-                     ? '⏳ Wait for first bid' 
-                     : '🚫 Pass on this player'}
+                  {(() => {
+                    const isNominator = currentAuction.nominated_by === currentUser.id;
+                    const hasBids = currentAuction.current_bid > currentAuction.base_price;
+                    const isLeadingBidder = currentAuction.leading_bidder === currentUser.id;
+                    
+                    if (hasUserPassed) return '✓ You have passed';
+                    if (isNominator && !hasBids) return '⏳ Wait for first bid';
+                    if (isLeadingBidder) return '🚫 Cannot pass while leading';
+                    return '🚫 Pass on this player';
+                  })()}
                 </button>
                 
                 {passes.length >= 4 && (
@@ -556,7 +653,9 @@ const AuctionPanel = ({ currentAuction, timeLeft, gameState, currentUser, teams,
                     placeholder="Search for a player (e.g., Lionel Messi)"
                     disabled={loading}
                   />
-                  <p className="text-xs text-gray-500 mt-1">Start typing to search from 6,000+ players</p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Start typing to search from available players (sold players excluded)
+                  </p>
                 </div>
                 
                 <div>
